@@ -14,45 +14,69 @@
 // External function from newriruhide.cpp
 extern "C" void riru_hide(const char *name);
 
-void load_so_file_standard(const char *game_data_dir, const Config::SoFile &soFile) {
+// After dlopen, call JNI_OnLoad(vm) or libhook_init(env) so the so can get JNI (for SandHook etc.)
+static void call_jni_onload_or_libhook_init(void *handle, JavaVM *vm) {
+    if (!handle || !vm) return;
+    typedef jint (*JNI_OnLoad_t)(JavaVM*, void*);
+    auto jni_onload = reinterpret_cast<JNI_OnLoad_t>(dlsym(handle, "JNI_OnLoad"));
+    if (jni_onload) {
+        jint res = jni_onload(vm, nullptr);
+        LOGI("JNI_OnLoad(vm) called, returned %d", res);
+        return;
+    }
+    JNIEnv *env = nullptr;
+    if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK || !env) {
+        LOGE("GetEnv failed for libhook_init");
+        return;
+    }
+    typedef void (*libhook_init_t)(JNIEnv*);
+    auto init_fn = reinterpret_cast<libhook_init_t>(dlsym(handle, "libhook_init"));
+    if (init_fn) {
+        init_fn(env);
+        LOGI("libhook_init(env) called");
+    }
+}
+
+void load_so_file_standard(const char *game_data_dir, const Config::SoFile &soFile, JavaVM *vm) {
     // Use original filename
     char so_path[512];
     snprintf(so_path, sizeof(so_path), "%s/files/%s", game_data_dir, soFile.name.c_str());
     
-    // Check if file exists
+    // Also try /data/local/tmp for libhook.so (common for development)
+    bool use_tmp = (soFile.name.find("libhook") != std::string::npos) && (access(so_path, F_OK) != 0);
+    if (use_tmp) {
+        snprintf(so_path, sizeof(so_path), "/data/local/tmp/%s", soFile.name.c_str());
+    }
+    
     if (access(so_path, F_OK) != 0) {
         LOGE("SO file not found: %s", so_path);
         return;
     }
     
-    // Load the SO file using standard dlopen (no hiding)
     void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
     if (handle) {
         LOGI("Successfully loaded SO via standard dlopen: %s", soFile.name.c_str());
+        call_jni_onload_or_libhook_init(handle, vm);
     } else {
         LOGE("Failed to load SO via standard dlopen: %s - %s", so_path, dlerror());
     }
 }
 
-void load_so_file_riru(const char *game_data_dir, const Config::SoFile &soFile) {
-    // Use original filename
+void load_so_file_riru(const char *game_data_dir, const Config::SoFile &soFile, JavaVM *vm) {
     char so_path[512];
     snprintf(so_path, sizeof(so_path), "%s/files/%s", game_data_dir, soFile.name.c_str());
-    
-    // Check if file exists
+    if ((soFile.name.find("libhook") != std::string::npos) && (access(so_path, F_OK) != 0)) {
+        snprintf(so_path, sizeof(so_path), "/data/local/tmp/%s", soFile.name.c_str());
+    }
     if (access(so_path, F_OK) != 0) {
         LOGE("SO file not found: %s", so_path);
         return;
     }
-    
-    // Load the SO file using dlopen (Riru method)
     void *handle = dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
     if (handle) {
         LOGI("Successfully loaded SO via Riru: %s", soFile.name.c_str());
-        
-        // Hide if configured
+        call_jni_onload_or_libhook_init(handle, vm);
         if (Config::shouldHideInjection()) {
-            // Hide using the original name
             riru_hide(soFile.name.c_str());
             LOGI("Applied riru_hide to: %s", soFile.name.c_str());
         }
@@ -114,9 +138,9 @@ void hack_thread_func(const char *game_data_dir, const char *package_name, JavaV
         if (method == Config::InjectionMethod::CUSTOM_LINKER) {
             load_so_file_custom_linker(game_data_dir, soFile, vm);
         } else if (method == Config::InjectionMethod::RIRU) {
-            load_so_file_riru(game_data_dir, soFile);
+            load_so_file_riru(game_data_dir, soFile, vm);
         } else {
-            load_so_file_standard(game_data_dir, soFile);
+            load_so_file_standard(game_data_dir, soFile, vm);
         }
     }
     
